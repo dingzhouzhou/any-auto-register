@@ -55,10 +55,9 @@ function parseExtraJson(raw: string | undefined) {
 function normalizeAccount(account: any) {
   const extra = parseExtraJson(account.extra_json)
   const syncStatuses = extra.sync_statuses && typeof extra.sync_statuses === 'object' ? extra.sync_statuses : {}
-  const cpaSync = syncStatuses.cpa && typeof syncStatuses.cpa === 'object' ? syncStatuses.cpa : {}
   const cliproxySync = syncStatuses.cliproxyapi && typeof syncStatuses.cliproxyapi === 'object' ? syncStatuses.cliproxyapi : {}
   const chatgptLocal = extra.chatgpt_local && typeof extra.chatgpt_local === 'object' ? extra.chatgpt_local : {}
-  return { ...account, extra, cpaSync, cliproxySync, chatgptLocal }
+  return { ...account, extra, cliproxySync, chatgptLocal }
 }
 
 function formatSyncTime(value?: string) {
@@ -864,15 +863,17 @@ export default function Accounts() {
         body: JSON.stringify(body),
       })
 
-      const actionLabel = mode === 'selected' ? '所选账号 CPA 上传' : '未上传账号 CPA 补传'
+      const actionLabel = mode === 'selected' ? '所选账号远端补传' : '远端未发现账号补传'
       if (!result.total) {
         message.info('没有可处理的账号')
-      } else if (!result.failed) {
+      } else if (!result.failed && !result.skipped) {
         message.success(`${actionLabel}完成：成功 ${result.success} / ${result.total}`)
+      } else if (!result.failed) {
+        message.success(`${actionLabel}完成：成功 ${result.success}，跳过 ${result.skipped} / ${result.total}`)
       } else if (!result.success) {
-        message.error(`${actionLabel}失败：成功 ${result.success} / ${result.total}`)
+        message.error(`${actionLabel}失败：成功 ${result.success}，跳过 ${result.skipped} / ${result.total}`)
       } else {
-        message.warning(`${actionLabel}部分完成：成功 ${result.success} / ${result.total}`)
+        message.warning(`${actionLabel}部分完成：成功 ${result.success}，跳过 ${result.skipped} / ${result.total}`)
       }
 
       showCpaSyncResult(`${actionLabel}结果`, result)
@@ -942,6 +943,14 @@ export default function Accounts() {
 
   const getStatusSyncScope = (): 'selected' | 'all' => (selectedRowKeys.length > 0 ? 'selected' : 'all')
 
+  const getBackfillScope = (): 'selected' | 'pending' => (selectedRowKeys.length > 0 ? 'selected' : 'pending')
+
+  const backfillButtonLabel = () => {
+    const scope = getBackfillScope()
+    const count = scope === 'selected' ? selectedRowKeys.length : total
+    return scope === 'selected' ? `补传所选远端未发现 (${count})` : `补传远端未发现 (${count})`
+  }
+
   const isChatgptPlatform = currentPlatform === 'chatgpt'
   const monospaceStyle: React.CSSProperties = {
     fontFamily: 'SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace',
@@ -950,14 +959,6 @@ export default function Accounts() {
   const secondaryTextStyle: React.CSSProperties = {
     fontSize: 12,
     color: token.colorTextSecondary,
-  }
-  const detailTextStyle: React.CSSProperties = {
-    ...secondaryTextStyle,
-    display: 'block',
-    maxWidth: '100%',
-    whiteSpace: 'nowrap',
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
   }
   const cellStackStyle: React.CSSProperties = {
     display: 'flex',
@@ -1080,33 +1081,6 @@ export default function Accounts() {
           return (
             <div style={{ ...cellStackStyle, ...compactPanelStyle }}>
               <Tag color={meta.color}>{meta.label}</Tag>
-            </div>
-          )
-        },
-      },
-      {
-        title: 'CPA',
-        key: 'cpa_sync',
-        width: 180,
-        render: (_: any, record: any) => {
-          const sync = record.cpaSync || {}
-          const uploaded = Boolean(sync.uploaded || sync.uploaded_at)
-          const attempted = Boolean(sync.last_attempt_at)
-          const color = uploaded ? 'success' : attempted ? 'error' : 'default'
-          const label = uploaded ? '已上传' : attempted ? '最近失败' : '未上传'
-          const time = uploaded ? sync.uploaded_at : sync.last_attempt_at
-
-          return (
-            <div style={{ ...cellStackStyle, ...compactPanelStyle }}>
-              <Tag color={color}>{label}</Tag>
-              <Text type="secondary" style={secondaryTextStyle}>
-                {time ? formatSyncTime(time) : '暂无记录'}
-              </Text>
-              {sync.last_message ? (
-                <Text type="secondary" ellipsis={{ tooltip: sync.last_message }} style={detailTextStyle}>
-                  {sync.last_message}
-                </Text>
-              ) : null}
             </div>
           )
         },
@@ -1244,23 +1218,21 @@ export default function Accounts() {
               </Button>
             </Dropdown>
           )}
-          {currentPlatform === 'chatgpt' && selectedRowKeys.length > 0 && (
-            <Popconfirm
-              title={`确认上传选中的 ${selectedRowKeys.length} 个账号到 CPA？`}
-              onConfirm={() => handleCpaBackfill('selected')}
-            >
-              <Button loading={cpaSyncLoading === 'selected'} icon={<UploadOutlined />}>
-                上传所选 CPA
-              </Button>
-            </Popconfirm>
-          )}
           {currentPlatform === 'chatgpt' && (
             <Popconfirm
-              title="确认补传当前筛选范围内尚未成功上传 CPA 的账号？"
-              onConfirm={() => handleCpaBackfill('pending')}
+              title={
+                getBackfillScope() === 'selected'
+                  ? `确认补传所选 ${selectedRowKeys.length} 个账号中远端未发现的 auth-file？`
+                  : '确认补传当前筛选范围内远端未发现且本地状态有效的账号？'
+              }
+              onConfirm={() => handleCpaBackfill(getBackfillScope())}
             >
-              <Button loading={cpaSyncLoading === 'pending'} icon={<UploadOutlined />} disabled={total === 0}>
-                补传未上传 CPA
+              <Button
+                loading={cpaSyncLoading === 'pending' || cpaSyncLoading === 'selected'}
+                icon={<UploadOutlined />}
+                disabled={getBackfillScope() === 'selected' ? selectedRowKeys.length === 0 : total === 0}
+              >
+                {backfillButtonLabel()}
               </Button>
             </Popconfirm>
           )}
@@ -1288,7 +1260,7 @@ export default function Accounts() {
           onChange: setSelectedRowKeys,
         }}
         pagination={{ pageSize: 20, showSizeChanger: false }}
-        scroll={{ x: isChatgptPlatform ? 1620 : 980 }}
+        scroll={{ x: isChatgptPlatform ? 1440 : 980 }}
         onRow={(record) => ({
           onDoubleClick: () => {
             setCurrentAccount(record)
