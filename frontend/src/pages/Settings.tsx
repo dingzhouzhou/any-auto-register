@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { App, Card, Form, Input, Select, Button, message, Tabs, Space, Tag, Typography, Modal, QRCode } from 'antd'
+import { App, Card, Form, Input, Select, Button, message, Tabs, Space, Tag, Typography, Modal, QRCode, Switch } from 'antd'
 import {
   SaveOutlined,
   EyeOutlined,
@@ -13,6 +13,7 @@ import {
   PlusOutlined,
   LockOutlined,
 } from '@ant-design/icons'
+import { parseBooleanConfigValue } from '@/lib/configValueParsers'
 import { apiFetch } from '@/lib/utils'
 
 const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
@@ -142,7 +143,7 @@ const TAB_ITEMS = [
           { key: 'cfworker_admin_token', label: '管理员 Token', secret: true },
           { key: 'cfworker_custom_auth', label: '站点密码', secret: true },
           { key: 'cfworker_subdomain', label: '固定子域名', placeholder: 'mail / pool-a' },
-          { key: 'cfworker_random_subdomain', label: '随机子域名', placeholder: 'true / false' },
+          { key: 'cfworker_random_subdomain', label: '随机子域名', type: 'boolean' },
           { key: 'cfworker_fingerprint', label: 'Fingerprint', placeholder: '6703363b...' },
         ],
       },
@@ -309,7 +310,7 @@ interface FieldConfig {
   key: string
   label: string
   placeholder?: string
-  type?: 'select' | 'input'
+  type?: 'select' | 'input' | 'boolean'
   secret?: boolean
 }
 
@@ -373,15 +374,23 @@ function parseStoredDomainList(value: unknown): string[] {
 function ConfigField({ field }: { field: FieldConfig }) {
   const [showSecret, setShowSecret] = useState(false)
   const options = SELECT_FIELDS[field.key]
+  const isBooleanField = field.type === 'boolean'
   const helpText =
     field.key === 'default_executor'
       ? '仅对支持的平台生效；ChatGPT、Cursor、Grok、Kiro、Tavily、Trae 支持浏览器模式，OpenBlockLabs 仅支持纯协议。'
       : undefined
 
   return (
-    <Form.Item label={field.label} name={field.key} extra={helpText}>
+    <Form.Item
+      label={field.label}
+      name={field.key}
+      extra={helpText}
+      valuePropName={isBooleanField ? 'checked' : undefined}
+    >
       {options ? (
         <Select options={options} style={{ width: '100%' }} />
+      ) : isBooleanField ? (
+        <Switch checkedChildren="开启" unCheckedChildren="关闭" />
       ) : field.secret ? (
         <Input.Password
           placeholder={field.placeholder}
@@ -1034,6 +1043,7 @@ export default function Settings() {
       }
       data.cfworker_domains = parseStoredDomainList(data.cfworker_domains)
       data.cfworker_enabled_domains = parseStoredDomainList(data.cfworker_enabled_domains)
+      data.cfworker_random_subdomain = parseBooleanConfigValue(data.cfworker_random_subdomain)
       form.setFieldsValue(data)
     })
   }, [form])
@@ -1056,12 +1066,14 @@ export default function Settings() {
       if (domains.length > 0) {
         values.cfworker_domain = ''
       }
+      values.cfworker_random_subdomain = parseBooleanConfigValue(values.cfworker_random_subdomain)
 
       await apiFetch('/config', { method: 'PUT', body: JSON.stringify({ data: values }) })
       form.setFieldsValue({
         cfworker_domains: domains,
         cfworker_enabled_domains: enabledDomains,
         cfworker_domain: domains.length > 0 ? '' : values.cfworker_domain,
+        cfworker_random_subdomain: values.cfworker_random_subdomain,
       })
       message.success('保存成功')
       setSaved(true)

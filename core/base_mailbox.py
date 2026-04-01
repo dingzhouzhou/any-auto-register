@@ -1591,48 +1591,69 @@ class LuckMailMailbox(BaseMailbox):
             raise RuntimeError("LuckMail 未找到已购邮箱 Token，无法等待验证码")
         self._log("[LuckMail] 等验证码分支: 已购邮箱 Token 收码")
 
+        import time
+
         exclude_codes = {
             str(code) for code in (kwargs.get("exclude_codes") or set()) if code
         }
+        seen_message_ids = {str(mid) for mid in (before_ids or set()) if mid}
+        if before_ids is None:
+            seen_message_ids = self.get_current_ids(account)
+            if seen_message_ids:
+                self._log(
+                    f"[LuckMail] 已建立旧邮件基线，先跳过 {len(seen_message_ids)} 封历史邮件"
+                )
 
-        def on_poll(result):
+        start = time.time()
+        saw_new_mail = False
+        while time.time() - start < timeout:
+            found_new_mail = False
+            try:
+                mail_list = self._client.user.get_token_mails(token)
+            except Exception as e:
+                raise TimeoutError(f"LuckMail 等待验证码失败: {e}") from e
+
+            for mail in mail_list.mails:
+                message_id = str(mail.message_id or "").strip()
+                if message_id and message_id in seen_message_ids:
+                    continue
+
+                found_new_mail = True
+                saw_new_mail = True
+                if message_id:
+                    seen_message_ids.add(message_id)
+
+                body = " ".join(
+                    [
+                        str(mail.subject or ""),
+                        str(mail.body or ""),
+                        str(mail.html_body or ""),
+                    ]
+                )
+                code = self._safe_extract(body, code_pattern)
+                if code and code in exclude_codes:
+                    self._log(
+                        f"[LuckMail] 跳过已使用验证码 message_id={message_id or '-'} code={code}"
+                    )
+                    continue
+                if code:
+                    self._log(f"[LuckMail] 收到验证码: {code}")
+                    return code
+
             self._log(
-                f"[LuckMail] 轮询中... 新邮件: {'是' if result.has_new_mail else '否'}"
+                f"[LuckMail] 轮询中... 新邮件: {'是' if found_new_mail else '否'}"
             )
 
-        try:
-            code_result = self._client.user.wait_for_token_code(
-                token=token,
-                timeout=timeout,
-                interval=3.0,
-                on_poll=on_poll,
-            )
-        except Exception as e:
-            raise TimeoutError(f"LuckMail 等待验证码失败: {e}") from e
+            if found_new_mail:
+                self._log("[LuckMail] 新邮件还不是可用验证码，继续等下一封...")
 
-        code = code_result.verification_code
-        if code and code in exclude_codes:
-            code = None
-        if not code and code_result.mail:
-            parsed_code = self._safe_extract(
-                json.dumps(code_result.mail, ensure_ascii=False), code_pattern
-            )
-            if parsed_code and parsed_code not in exclude_codes:
-                code = parsed_code
-        if not code and (code_result.has_new_mail or before_ids is None):
-            code = self._extract_code_from_token_mails(
-                token,
-                code_pattern,
-                before_ids=before_ids,
-                exclude_codes=exclude_codes,
-            )
-
-        if code:
-            self._log(f"[LuckMail] 收到验证码: {code}")
-            return code
+            remaining = timeout - (time.time() - start)
+            if remaining <= 0:
+                break
+            time.sleep(min(3.0, max(0.5, remaining)))
 
         raise TimeoutError(
-            f"LuckMail 等待验证码超时 ({timeout}s)，最终状态: has_new_mail={code_result.has_new_mail}"
+            f"LuckMail 等待验证码超时 ({timeout}s)，最终状态: has_new_mail={saw_new_mail}"
         )
 
 

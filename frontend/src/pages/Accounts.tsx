@@ -31,6 +31,7 @@ import {
 } from '@ant-design/icons'
 import { ChatGPTRegistrationModeSwitch } from '@/components/ChatGPTRegistrationModeSwitch'
 import { usePersistentChatGPTRegistrationMode } from '@/hooks/usePersistentChatGPTRegistrationMode'
+import { parseBooleanConfigValue } from '@/lib/configValueParsers'
 import { buildChatGPTRegistrationRequestAdapter } from '@/lib/chatgptRegistrationRequestAdapter'
 import { apiFetch, API_BASE, getToken } from '@/lib/utils'
 import { normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
@@ -814,7 +815,7 @@ export default function Accounts() {
         cfworker_custom_auth: cfg.cfworker_custom_auth,
         cfworker_domain: cfg.cfworker_domain,
         cfworker_subdomain: cfg.cfworker_subdomain,
-        cfworker_random_subdomain: cfg.cfworker_random_subdomain,
+        cfworker_random_subdomain: parseBooleanConfigValue(cfg.cfworker_random_subdomain),
         cfworker_fingerprint: cfg.cfworker_fingerprint,
         smstome_cookie: cfg.smstome_cookie,
         smstome_country_slugs: cfg.smstome_country_slugs,
