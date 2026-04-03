@@ -45,10 +45,10 @@ class OpenAIHTTPClient(HTTPClient):
 
     def check_ip_location(self) -> Tuple[bool, Optional[str]]:
         """
-        检查 IP 地理位置
+        获取 IP 地理位置
 
         Returns:
-            Tuple[是否支持, 位置信息]
+            Tuple[是否继续流程, 位置信息]
         """
         try:
             response = self.get("https://cloudflare.com/cdn-cgi/trace", timeout=10)
@@ -59,14 +59,11 @@ class OpenAIHTTPClient(HTTPClient):
             loc_match = re.search(r"loc=([A-Z]+)", trace_text)
             loc = loc_match.group(1) if loc_match else None
 
-            # 检查是否支持
-            if loc in ["CN", "HK", "MO", "TW"]:
-                return False, loc
             return True, loc
 
         except Exception as e:
-            logger.error(f"检查 IP 地理位置失败: {e}")
-            return False, None
+            logger.warning(f"获取 IP 地理位置失败，继续流程: {e}")
+            return True, None
 
     def send_openai_request(
         self,

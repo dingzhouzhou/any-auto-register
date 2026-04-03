@@ -19,8 +19,10 @@ class _TrackingMailbox:
         self.account = MailboxAccount(email="demo@example.com", account_id="tracked-mailbox")
         self.wait_call = None
         self.current_ids_calls = []
+        self.get_email_calls = 0
 
     def get_email(self):
+        self.get_email_calls += 1
         return self.account
 
     def get_current_ids(self, account):
@@ -51,6 +53,18 @@ class _VerificationAdapter:
             exclude_codes={"654321"},
         )
         self.last_code = code
+        return mock.Mock(success=True)
+
+    def build_account(self, result, fallback_password):
+        return {"success": True, "password": fallback_password}
+
+
+class _ReuseCreateEmailAdapter:
+    def run(self, context):
+        first = context.email_service.create_email()
+        second = context.email_service.create_email()
+        self.first = first
+        self.second = second
         return mock.Mock(success=True)
 
     def build_account(self, result, fallback_password):
@@ -96,6 +110,30 @@ class ChatGPTPluginTests(unittest.TestCase):
         self.assertEqual(kwargs.get("before_ids"), {"mid-1"})
         self.assertEqual(kwargs.get("otp_sent_at"), 123.0)
         self.assertEqual(kwargs.get("exclude_codes"), {"654321"})
+
+    def test_custom_provider_reuses_existing_mailbox_account_across_retries(self):
+        mailbox = _TrackingMailbox()
+        platform = ChatGPTPlatform(
+            config=RegisterConfig(extra={"chatgpt_registration_mode": "refresh_token"}),
+            mailbox=mailbox,
+        )
+        logs = []
+        platform._log_fn = logs.append
+        adapter = _ReuseCreateEmailAdapter()
+
+        with mock.patch(
+            "platforms.chatgpt.plugin.build_chatgpt_registration_mode_adapter",
+            return_value=adapter,
+        ):
+            result = platform.register()
+
+        self.assertEqual(result["success"], True)
+        self.assertEqual(mailbox.get_email_calls, 1)
+        self.assertEqual(adapter.first["email"], "demo@example.com")
+        self.assertEqual(adapter.second["email"], "demo@example.com")
+        self.assertEqual(adapter.first["service_id"], "tracked-mailbox")
+        self.assertEqual(adapter.second["service_id"], "tracked-mailbox")
+        self.assertTrue(any("复用已购邮箱" in line for line in logs))
 
 
 if __name__ == "__main__":

@@ -116,19 +116,16 @@ class OAuthPkceClient:
     # ══════════════════════════════════════════════════════════════════
 
     def check_ip_region(self) -> str:
-        """检查当前 IP 地区，CN/HK 不支持。"""
+        """检查当前 IP 地区，仅记录结果，不做地区拦截。"""
         try:
             resp = self.session.get(CLOUDFLARE_TRACE, timeout=10)
             match = re.search(r"^loc=(.+)$", resp.text, re.MULTILINE)
             loc = match.group(1).strip() if match else "UNKNOWN"
             self._log(f"当前 IP 地区: {loc}")
-            if loc in ("CN", "HK"):
-                raise RuntimeError(f"IP 地区不支持: {loc}")
             return loc
-        except RuntimeError:
-            raise
         except Exception as e:
-            raise RuntimeError(f"IP 地区检查失败: {e}") from e
+            self._log(f"IP 地区检查失败，继续流程: {e}")
+            return "UNKNOWN"
 
     # ══════════════════════════════════════════════════════════════════
     # 步骤 2：访问 OAuth 授权 URL，获取 oai-did Cookie

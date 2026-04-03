@@ -255,17 +255,14 @@ class RefreshTokenRegistrationEngine:
 
                 seed_oai_device_cookie(self.session, self._device_id)
 
-                response = self.session.get(
-                    self.oauth_start.auth_url,
-                    timeout=20
-                )
+                response = self._bootstrap_oauth_session()
 
-                if response.status_code < 400:
+                if response is not None and response.status_code < 400:
                     self._log(f"Device ID: {self._device_id}")
                     return self._device_id
 
                 self._log(
-                    f"获取 Device ID 失败: 建立 OAuth 会话返回 HTTP {response.status_code} (第 {attempt}/{max_attempts} 次)",
+                    f"获取 Device ID 失败: 建立 OAuth 会话返回 HTTP {getattr(response, 'status_code', 'UNKNOWN')} (第 {attempt}/{max_attempts} 次)",
                     "warning" if attempt < max_attempts else "error"
                 )
             except Exception as e:
@@ -280,6 +277,44 @@ class RefreshTokenRegistrationEngine:
                 self.session = self.http_client.session
 
         return None
+
+    def _bootstrap_oauth_session(self):
+        """以浏览器导航方式建立 auth.openai.com OAuth 会话。"""
+        if not self.session or not self.oauth_start:
+            return None
+
+        parsed = urllib.parse.urlparse(self.oauth_start.auth_url)
+        query_params = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
+
+        request_targets = [
+            (
+                self.oauth_start.auth_url,
+                {},
+                "OAuth 授权页",
+            ),
+            (
+                f"{parsed.scheme}://{parsed.netloc}/api/oauth/oauth2/auth",
+                {"params": query_params},
+                "OAuth 会话兜底接口",
+            ),
+        ]
+
+        last_response = None
+        for url, extra_kwargs, label in request_targets:
+            response = self.session.get(
+                url,
+                headers=self._build_navigation_headers(referer="https://chatgpt.com/"),
+                allow_redirects=True,
+                timeout=30,
+                **extra_kwargs,
+            )
+            last_response = response
+            redirects = len(getattr(response, "history", []) or [])
+            self._log(f"{label}: HTTP {response.status_code}, redirects={redirects}")
+            if response.status_code < 400:
+                return response
+
+        return last_response
 
     def _default_user_agent(self) -> str:
         try:
@@ -1312,15 +1347,13 @@ class RefreshTokenRegistrationEngine:
             self._log("注册流程启动")
             self._log("=" * 60)
 
-            # 1. 检查 IP 地理位置
+            # 1. 获取 IP 地理位置
             self._log("1. 检查 IP 地理位置...")
             ip_ok, location = self._check_ip_location()
             if not ip_ok:
-                result.error_message = f"IP 地理位置不支持: {location}"
-                self._log(f"IP 检查失败: {location}", "error")
-                return result
-
-            self._log(f"IP 位置: {location}")
+                self._log("IP 地理位置获取失败，继续注册流程", "warning")
+            else:
+                self._log(f"IP 位置: {location}")
 
             # 2. 创建邮箱
             self._log("2. 创建邮箱...")

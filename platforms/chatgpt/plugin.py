@@ -69,9 +69,16 @@ class ChatGPTPlatform(BasePlatform):
                     self._acct = None
                     self._email = _fixed_email
                     self._before_ids = set()
+                    self._reuse_logged = False
 
                 def create_email(self, config=None):
-                    if self._email and self._acct and _fixed_email:
+                    if self._email and self._acct:
+                        if not self._reuse_logged:
+                            log_fn(
+                                f"[MailboxReuse] 复用已购邮箱: {self._email} "
+                                f"(service_id={self._acct.account_id})，不再二次购买"
+                            )
+                            self._reuse_logged = True
                         return {"email": self._email, "service_id": self._acct.account_id, "token": ""}
                     self._acct = _mailbox.get_email()
                     get_current_ids = getattr(_mailbox, "get_current_ids", None)
