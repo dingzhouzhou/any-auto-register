@@ -538,6 +538,7 @@ def update_global_phone_list(
     jitter: float = 0.5,
     require_recent_history: bool = True,
     recent_history_minutes: float = DEFAULT_RECENT_HISTORY_MINUTES,
+    trace: Optional[Callable[[str], None]] = None,
 ) -> int:
     """抓取多个国家的号码并写入 txt 文件。
 
@@ -565,6 +566,8 @@ def update_global_phone_list(
         写入文件的去重后手机号数量。
     """
 
+    emit = trace or (lambda _msg: None)
+
     if countries is None:
         countries = DEFAULT_COUNTRY_SLUGS
 
@@ -573,6 +576,7 @@ def update_global_phone_list(
         phone_map: Dict[str, PhoneEntry] = {}
 
         for country_slug in countries:
+            emit(f"[SMSToMe] 开始同步国家: {country_slug}")
             first_url = f"{SMSTOME_BASE_URL}/country/{country_slug}"
             first_page_html = _fetch_with_retries(client, first_url, max_attempts=http_max_attempts)
             first_tree = HTMLParser(first_page_html)
@@ -580,6 +584,13 @@ def update_global_phone_list(
                 detected_max_page=_detect_max_page(first_tree),
                 start_page=start_page,
                 max_pages_per_country=max_pages_per_country,
+            )
+            if not page_window:
+                emit(f"[SMSToMe] 国家 {country_slug} 没有可抓取分页")
+                continue
+            emit(
+                f"[SMSToMe] 国家 {country_slug} 分页范围: "
+                f"{page_window[0]}-{page_window[-1]} (共 {len(page_window)} 页)"
             )
 
             for index, page in enumerate(page_window):
@@ -591,16 +602,28 @@ def update_global_phone_list(
                     url = f"{first_url}?page={page}"
                     html = _fetch_with_retries(client, url, max_attempts=http_max_attempts)
                 tree = HTMLParser(html)
+                before_count = len(phone_map)
                 _collect_numbers_from_country_page(tree, country_slug, phone_map)
+                page_added = len(phone_map) - before_count
+                emit(
+                    f"[SMSToMe] 国家 {country_slug} 第 {page}/{page_window[-1]} 页完成: "
+                    f"新增 {page_added} 个, 累计 {len(phone_map)} 个"
+                )
                 if page == 1 and index + 1 < len(page_window):
                     _polite_sleep(per_page_delay, jitter)
 
             # 每个国家抓取完后再稍微停顿一下
+            emit(f"[SMSToMe] 国家 {country_slug} 抓取完成，当前累计 {len(phone_map)} 个号码")
             _polite_sleep(per_country_delay, jitter)
 
         if require_recent_history:
+            emit(
+                f"[SMSToMe] 开始按最近 {recent_history_minutes:.0f} 分钟短信历史过滤，"
+                f"待检查 {len(phone_map)} 个号码"
+            )
             filtered_phone_map: Dict[str, PhoneEntry] = {}
-            for phone in sorted(phone_map.keys()):
+            total = len(phone_map)
+            for idx, phone in enumerate(sorted(phone_map.keys()), start=1):
                 entry = phone_map[phone]
                 try:
                     messages = _fetch_sms_messages(
@@ -609,13 +632,20 @@ def update_global_phone_list(
                         http_max_attempts=http_max_attempts,
                     )
                 except Exception:
+                    emit(f"[SMSToMe] 过滤号码 {idx}/{total} 失败: {entry.phone}")
                     continue
                 if _has_recent_sms_history(
                     messages,
                     max_age_minutes=recent_history_minutes,
                 ):
                     filtered_phone_map[phone] = entry
+                if idx == 1 or idx == total or idx % 10 == 0:
+                    emit(
+                        f"[SMSToMe] 短信历史过滤进度: {idx}/{total}, "
+                        f"保留 {len(filtered_phone_map)} 个"
+                    )
             phone_map = filtered_phone_map
+            emit(f"[SMSToMe] 短信历史过滤完成，剩余 {len(phone_map)} 个号码")
 
         output = Path(output_path)
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -626,6 +656,7 @@ def update_global_phone_list(
                 entry = phone_map[phone]
                 f.write(f"{entry.phone}\t{entry.country_slug}\t{entry.detail_url}\n")
 
+        emit(f"[SMSToMe] 同步写入完成: {output} ({len(phone_map)} 个号码)")
         return len(phone_map)
     finally:
         client.close()

@@ -7,6 +7,7 @@ from platforms.chatgpt.refresh_token_registration_engine import (
     RefreshTokenRegistrationEngine,
     SignupFormResult,
 )
+from platforms.chatgpt.utils import FlowState
 
 
 class DummyEmailService:
@@ -184,6 +185,58 @@ class RegistrationEngineFlowTests(unittest.TestCase):
         restart_login.assert_called_once()
         complete_exchange.assert_called_once()
 
+    def test_run_prewarms_phone_pool_before_email_and_auth(self):
+        events = []
+        engine = RefreshTokenRegistrationEngine(
+            email_service=DummyEmailService(),
+            proxy_url="http://127.0.0.1:7890",
+            callback_logger=lambda msg: None,
+            extra_config={"smstome_cookie": "cf_clearance=demo"},
+        )
+
+        def fake_prewarm():
+            events.append("prewarm")
+
+        def fake_create_email():
+            events.append("create_email")
+            engine.email_info = {"email": "user@example.com", "service_id": "svc-1"}
+            engine.email = "user@example.com"
+            return True
+
+        def fake_prepare_authorize_flow(*_args, **_kwargs):
+            events.append("prepare_auth")
+            return "did", "sentinel"
+
+        def fake_complete_token_exchange(result):
+            events.append("complete_exchange")
+            result.account_id = "acct-1"
+            result.workspace_id = "ws-1"
+            result.access_token = "at"
+            result.refresh_token = "rt"
+            result.id_token = "id"
+            return True
+
+        def fake_submit_signup_form(*_args, **_kwargs):
+            engine._is_existing_account = True
+            engine._otp_sent_at = 1.0
+            return SignupFormResult(
+                success=True,
+                page_type="email_otp_verification",
+                is_existing_account=True,
+            )
+
+        with mock.patch.object(engine, "_check_ip_location", return_value=(True, "US")), \
+            mock.patch.object(engine, "_prewarm_phone_pool_if_needed", side_effect=fake_prewarm) as prewarm, \
+            mock.patch.object(engine, "_create_email", side_effect=fake_create_email), \
+            mock.patch.object(engine, "_prepare_authorize_flow", side_effect=fake_prepare_authorize_flow), \
+            mock.patch.object(engine, "_submit_signup_form", side_effect=fake_submit_signup_form), \
+            mock.patch.object(engine, "_complete_token_exchange", side_effect=fake_complete_token_exchange):
+            result = engine.run()
+
+        self.assertTrue(result.success)
+        prewarm.assert_called_once()
+        self.assertEqual(events[:3], ["prewarm", "create_email", "prepare_auth"])
+
     def test_run_skips_registration_steps_for_existing_account(self):
         engine = self._make_engine()
 
@@ -234,6 +287,64 @@ class RegistrationEngineFlowTests(unittest.TestCase):
         create_account.assert_not_called()
         restart_login.assert_not_called()
         complete_exchange.assert_called_once()
+
+    def test_complete_token_exchange_hands_off_post_otp_state_to_oauth_client(self):
+        engine = self._make_engine()
+        engine.email = "user@example.com"
+        engine.password = "Secret123!"
+        engine._device_id = "device-fixed"
+        engine._post_otp_page_type = "add_phone"
+        engine._post_otp_continue_url = ""
+        engine.oauth_start = mock.Mock(code_verifier="verifier")
+        engine.session = mock.Mock()
+        engine.session.cookies.get.side_effect = lambda name: (
+            "session-cookie" if name == "__Secure-next-auth.session-token" else None
+        )
+        engine._decode_auth_session_cookie = mock.Mock(
+            return_value={"workspaces": [{"id": "ws-1"}]}
+        )
+        engine.oauth_manager.extract_account_info = mock.Mock(
+            return_value={"account_id": "acct-1"}
+        )
+
+        result = mock.Mock(spec=[])
+        result.account_id = ""
+        result.access_token = ""
+        result.refresh_token = ""
+        result.id_token = ""
+        result.workspace_id = ""
+        result.password = ""
+        result.source = ""
+        result.session_token = ""
+        result.error_message = ""
+
+        oauth_client = mock.Mock()
+        oauth_client.last_error = ""
+        oauth_client.continue_from_state_and_get_tokens.return_value = {
+            "access_token": "at",
+            "refresh_token": "rt",
+            "id_token": "id-token",
+        }
+
+        with mock.patch.object(engine, "_get_verification_code", return_value="123456"), \
+            mock.patch.object(engine, "_validate_verification_code", return_value=True), \
+            mock.patch("platforms.chatgpt.oauth_client.OAuthClient", return_value=oauth_client):
+            ok = engine._complete_token_exchange(result)
+
+        self.assertTrue(ok)
+        self.assertEqual(result.account_id, "acct-1")
+        self.assertEqual(result.workspace_id, "ws-1")
+        self.assertEqual(result.access_token, "at")
+        self.assertEqual(result.refresh_token, "rt")
+        self.assertEqual(result.id_token, "id-token")
+        self.assertEqual(result.password, "Secret123!")
+        self.assertEqual(result.source, "register")
+        self.assertEqual(result.session_token, "session-cookie")
+        oauth_client.continue_from_state_and_get_tokens.assert_called_once()
+        handed_state = oauth_client.continue_from_state_and_get_tokens.call_args.args[0]
+        self.assertIsInstance(handed_state, FlowState)
+        self.assertEqual(handed_state.page_type, "add_phone")
+        self.assertEqual(handed_state.current_url, "https://auth.openai.com/add-phone")
 
     @mock.patch(
         "platforms.chatgpt.refresh_token_registration_engine.build_sentinel_token",

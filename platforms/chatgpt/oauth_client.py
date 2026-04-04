@@ -648,88 +648,38 @@ class OAuthClient:
             self._set_error(f"密码验证异常: {e}")
             return None
 
-    def login_and_get_tokens(
+    def _drive_oauth_state_machine(
         self,
-        email,
-        password,
+        initial_state,
+        *,
+        code_verifier,
         device_id,
         user_agent=None,
         sec_ch_ua=None,
         impersonate=None,
+        email=None,
+        password=None,
         skymail_client=None,
+        referer=None,
+        max_steps=20,
     ):
-        """
-        完整的 OAuth 登录流程，获取 tokens
-
-        Args:
-            email: 邮箱
-            password: 密码
-            device_id: 设备 ID
-            user_agent: User-Agent
-            sec_ch_ua: sec-ch-ua header
-            impersonate: curl_cffi impersonate 参数
-            skymail_client: Skymail 客户端（用于获取 OTP，如果需要）
-
-        Returns:
-            dict: tokens 字典，包含 access_token, refresh_token, id_token
-        """
-        self.last_error = ""
-        self._log("开始 OAuth 登录流程...")
-
-        code_verifier, code_challenge = generate_pkce()
-        oauth_state = secrets.token_urlsafe(32)
-        authorize_params = {
-            "response_type": "code",
-            "client_id": self.oauth_client_id,
-            "redirect_uri": self.oauth_redirect_uri,
-            "scope": "openid profile email offline_access",
-            "code_challenge": code_challenge,
-            "code_challenge_method": "S256",
-            "state": oauth_state,
-        }
-        authorize_url = f"{self.oauth_issuer}/oauth/authorize"
-
-        seed_oai_device_cookie(self.session, device_id)
-
-        self._log("步骤1: Bootstrap OAuth session...")
-        authorize_final_url = self._bootstrap_oauth_session(
-            authorize_url,
-            authorize_params,
-            device_id=device_id,
-            user_agent=user_agent,
-            sec_ch_ua=sec_ch_ua,
-            impersonate=impersonate,
-        )
-        if not authorize_final_url:
-            self._set_error("Bootstrap 失败")
+        """从当前 OAuth 状态继续推进，直到拿到 tokens 或失败。"""
+        if not initial_state:
+            self._set_error("OAuth 状态机缺少初始状态")
+            return None
+        if not code_verifier:
+            self._set_error("OAuth 状态机缺少 code_verifier")
+            return None
+        if not device_id:
+            self._set_error("OAuth 状态机缺少 device_id")
             return None
 
-        continue_referer = (
-            authorize_final_url
-            if authorize_final_url.startswith(self.oauth_issuer)
-            else f"{self.oauth_issuer}/log-in"
-        )
-
-        state = self._submit_authorize_continue(
-            email,
-            device_id,
-            continue_referer,
-            user_agent=user_agent,
-            sec_ch_ua=sec_ch_ua,
-            impersonate=impersonate,
-            authorize_url=authorize_url,
-            authorize_params=authorize_params,
-        )
-        if not state:
-            if not self.last_error:
-                self._set_error("提交邮箱后未进入有效的 OAuth 状态")
-            return None
-
+        state = initial_state
         self._log(f"OAuth 状态起点: {describe_flow_state(state)}")
         seen_states = {}
-        referer = continue_referer
+        referer = referer or state.current_url or state.continue_url or self.oauth_issuer
 
-        for step in range(20):
+        for _step in range(max_steps):
             signature = self._state_signature(state)
             seen_states[signature] = seen_states.get(signature, 0) + 1
             if seen_states[signature] > 2:
@@ -750,6 +700,9 @@ class OAuthClient:
                 return tokens
 
             if self._state_is_login_password(state):
+                if not password:
+                    self._set_error("当前 OAuth 状态要求密码验证，但未提供 password")
+                    return None
                 next_state = self._submit_password_verify(
                     password,
                     device_id,
@@ -767,8 +720,8 @@ class OAuthClient:
                 continue
 
             if self._state_is_email_otp(state):
-                if not skymail_client:
-                    self._set_error("当前流程需要邮箱 OTP，但缺少接码客户端")
+                if not skymail_client or not email:
+                    self._set_error("当前 OAuth 状态要求邮箱 OTP，但缺少 email/skymail_client")
                     return None
                 next_state = self._handle_otp_verification(
                     email,
@@ -864,6 +817,124 @@ class OAuthClient:
 
         self._set_error("OAuth 状态机超出最大步数")
         return None
+
+    def continue_from_state_and_get_tokens(
+        self,
+        initial_state,
+        *,
+        code_verifier,
+        device_id,
+        user_agent=None,
+        sec_ch_ua=None,
+        impersonate=None,
+        email=None,
+        password=None,
+        skymail_client=None,
+        referer=None,
+    ):
+        """复用现有 session，从已有 OAuth 状态继续直到换取 tokens。"""
+        self.last_error = ""
+        return self._drive_oauth_state_machine(
+            initial_state,
+            code_verifier=code_verifier,
+            device_id=device_id,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            impersonate=impersonate,
+            email=email,
+            password=password,
+            skymail_client=skymail_client,
+            referer=referer,
+        )
+
+    def login_and_get_tokens(
+        self,
+        email,
+        password,
+        device_id,
+        user_agent=None,
+        sec_ch_ua=None,
+        impersonate=None,
+        skymail_client=None,
+    ):
+        """
+        完整的 OAuth 登录流程，获取 tokens
+
+        Args:
+            email: 邮箱
+            password: 密码
+            device_id: 设备 ID
+            user_agent: User-Agent
+            sec_ch_ua: sec-ch-ua header
+            impersonate: curl_cffi impersonate 参数
+            skymail_client: Skymail 客户端（用于获取 OTP，如果需要）
+
+        Returns:
+            dict: tokens 字典，包含 access_token, refresh_token, id_token
+        """
+        self.last_error = ""
+        self._log("开始 OAuth 登录流程...")
+
+        code_verifier, code_challenge = generate_pkce()
+        oauth_state = secrets.token_urlsafe(32)
+        authorize_params = {
+            "response_type": "code",
+            "client_id": self.oauth_client_id,
+            "redirect_uri": self.oauth_redirect_uri,
+            "scope": "openid profile email offline_access",
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+            "state": oauth_state,
+        }
+        authorize_url = f"{self.oauth_issuer}/oauth/authorize"
+
+        seed_oai_device_cookie(self.session, device_id)
+
+        self._log("步骤1: Bootstrap OAuth session...")
+        authorize_final_url = self._bootstrap_oauth_session(
+            authorize_url,
+            authorize_params,
+            device_id=device_id,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            impersonate=impersonate,
+        )
+        if not authorize_final_url:
+            self._set_error("Bootstrap 失败")
+            return None
+
+        continue_referer = (
+            authorize_final_url
+            if authorize_final_url.startswith(self.oauth_issuer)
+            else f"{self.oauth_issuer}/log-in"
+        )
+
+        state = self._submit_authorize_continue(
+            email,
+            device_id,
+            continue_referer,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            impersonate=impersonate,
+            authorize_url=authorize_url,
+            authorize_params=authorize_params,
+        )
+        if not state:
+            if not self.last_error:
+                self._set_error("提交邮箱后未进入有效的 OAuth 状态")
+            return None
+        return self._drive_oauth_state_machine(
+            state,
+            code_verifier=code_verifier,
+            device_id=device_id,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            impersonate=impersonate,
+            email=email,
+            password=password,
+            skymail_client=skymail_client,
+            referer=continue_referer,
+        )
 
     def _extract_code_from_url(self, url):
         """从 URL 中提取 code"""

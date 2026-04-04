@@ -21,6 +21,8 @@ from .http_client import OpenAIHTTPClient
 from .sentinel_browser import get_sentinel_token_via_browser
 from .sentinel_token import build_sentinel_token
 from .utils import (
+    describe_flow_state,
+    extract_flow_state,
     generate_datadog_trace,
     generate_device_id,
     generate_random_password,
@@ -103,6 +105,7 @@ class RefreshTokenRegistrationEngine:
         callback_logger: Optional[Callable[[str], None]] = None,
         task_uuid: Optional[str] = None,
         browser_mode: str = "headless",
+        extra_config: Optional[Dict[str, Any]] = None,
     ):
         """
         初始化注册引擎
@@ -118,6 +121,7 @@ class RefreshTokenRegistrationEngine:
         self.callback_logger = callback_logger or (lambda msg: logger.info(msg))
         self.task_uuid = task_uuid
         self.browser_mode = str(browser_mode or "headless").strip().lower()
+        self.extra_config = dict(extra_config or {})
 
         # 创建 HTTP 客户端
         self.http_client = OpenAIHTTPClient(proxy_url=proxy_url)
@@ -595,25 +599,24 @@ class RefreshTokenRegistrationEngine:
             result.error_message = "验证码校验失败"
             return False
 
-        self._log("解析 OTP 后的 OAuth 跳转状态...")
-        continue_url = self._resolve_post_otp_continue_url()
-        self._log("执行 consent/workspace/organization 流程...")
-        callback_url, workspace_id = self._resolve_oauth_callback_url(continue_url)
-        if not callback_url:
-            result.error_message = "未获取到 OAuth 回调地址"
+        if not self.oauth_start or not str(self.oauth_start.code_verifier or "").strip():
+            result.error_message = "OAuth 状态缺少 code_verifier"
             return False
-        result.workspace_id = workspace_id or ""
 
-        self._log("处理 OAuth 回调并获取 Token...")
-        token_info = self._handle_oauth_callback(callback_url)
+        oauth_state = self._build_post_otp_flow_state()
+        self._log(f"OTP 后状态: {describe_flow_state(oauth_state)}")
+        self._log("将 OTP 后续流程交给 OAuthClient 状态机继续执行...")
+        token_info = self._continue_oauth_state_machine(oauth_state)
         if not token_info:
-            result.error_message = "处理 OAuth 回调失败"
+            result.error_message = "OAuth 状态机处理失败"
             return False
 
-        result.account_id = token_info.get("account_id", "")
-        result.access_token = token_info.get("access_token", "")
-        result.refresh_token = token_info.get("refresh_token", "")
-        result.id_token = token_info.get("id_token", "")
+        result.access_token = str(token_info.get("access_token") or "")
+        result.refresh_token = str(token_info.get("refresh_token") or "")
+        result.id_token = str(token_info.get("id_token") or "")
+        account_info = self.oauth_manager.extract_account_info(result.id_token)
+        result.account_id = str(account_info.get("account_id") or "")
+        result.workspace_id = self._extract_workspace_id_from_auth_cookie()
         result.password = self.password or ""
         result.source = "login" if self._is_existing_account else "register"
 
@@ -624,6 +627,88 @@ class RefreshTokenRegistrationEngine:
             self._log("成功获取 Session Token")
 
         return True
+
+    def _build_post_otp_flow_state(self):
+        page_type = str(self._post_otp_page_type or "").strip()
+        continue_url = normalize_flow_url(
+            self._post_otp_continue_url,
+            auth_base="https://auth.openai.com",
+        )
+
+        fallback_paths = {
+            "add_phone": "https://auth.openai.com/add-phone",
+            "phone_otp_verification": "https://auth.openai.com/phone-verification",
+            "email_otp_verification": "https://auth.openai.com/email-verification",
+            "consent": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+            "workspace_selection": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+            "organization_selection": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+        }
+        current_url = continue_url or fallback_paths.get(
+            page_type.lower(),
+            "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+        )
+
+        payload = {}
+        if page_type:
+            payload["page"] = {"type": page_type}
+        if continue_url:
+            payload["continue_url"] = continue_url
+
+        return extract_flow_state(
+            data=payload or None,
+            current_url=current_url,
+            auth_base="https://auth.openai.com",
+        )
+
+    def _continue_oauth_state_machine(self, oauth_state):
+        from .oauth_client import OAuthClient
+
+        oauth_config = dict(self.extra_config or {})
+        oauth_config.setdefault("oauth_client_id", self.oauth_manager.client_id)
+        oauth_config.setdefault("oauth_redirect_uri", self.oauth_manager.redirect_uri)
+
+        client = OAuthClient(
+            config=oauth_config,
+            proxy=self.proxy_url,
+            verbose=False,
+            browser_mode=self.browser_mode,
+        )
+        client.session = self.session
+        client._log = lambda msg: self._log(f"[OAuth] {msg}")
+
+        token_info = client.continue_from_state_and_get_tokens(
+            oauth_state,
+            code_verifier=self.oauth_start.code_verifier,
+            device_id=self._device_id or "",
+            user_agent=self._default_user_agent(),
+            email=self.email or "",
+            referer="https://auth.openai.com/email-verification",
+        )
+        if token_info:
+            return token_info
+
+        detail = str(client.last_error or "").strip()
+        if detail:
+            self._log(f"OAuthClient 状态机失败: {detail}", "error")
+        return None
+
+    def _extract_workspace_id_from_auth_cookie(self) -> str:
+        auth_json = self._decode_auth_session_cookie() or {}
+        workspaces = auth_json.get("workspaces") or []
+        if not workspaces:
+            return ""
+        return str((workspaces[0] or {}).get("id") or "").strip()
+
+    def _prewarm_phone_pool_if_needed(self) -> None:
+        from .phone_service import SMSToMePhoneService
+
+        phone_service = SMSToMePhoneService(self.extra_config, log_fn=self._log)
+        if not phone_service.enabled:
+            return
+
+        self._log("2. 预热 SMSToMe 号码池...")
+        phone_service.ensure_pool_ready()
+        self._log("SMSToMe 号码池预热完成")
 
     def _restart_login_flow(self) -> Tuple[bool, str]:
         """新注册账号完成建号后，重新发起一次登录流程拿 token。"""
@@ -1355,15 +1440,22 @@ class RefreshTokenRegistrationEngine:
             else:
                 self._log(f"IP 位置: {location}")
 
-            # 2. 创建邮箱
-            self._log("2. 创建邮箱...")
+            # 2. 预热手机号池（如已配置）
+            try:
+                self._prewarm_phone_pool_if_needed()
+            except Exception as e:
+                result.error_message = f"预热 SMSToMe 号码池失败: {e}"
+                return result
+
+            # 3. 创建邮箱
+            self._log("3. 创建邮箱...")
             if not self._create_email():
                 result.error_message = "创建邮箱失败"
                 return result
 
             result.email = self.email
 
-            # 3. 准备首轮授权流程
+            # 4. 准备首轮授权流程
             did, sen_token = self._prepare_authorize_flow("首次授权")
             if not did:
                 result.error_message = "获取 Device ID 失败"
@@ -1372,8 +1464,8 @@ class RefreshTokenRegistrationEngine:
                 result.error_message = "Sentinel POW 验证失败"
                 return result
 
-            # 4. 提交注册入口邮箱
-            self._log("4. 提交注册邮箱...")
+            # 5. 提交注册入口邮箱
+            self._log("5. 提交注册邮箱...")
             signup_result = self._submit_signup_form(did, sen_token)
             if not signup_result.success:
                 result.error_message = f"提交注册表单失败: {signup_result.error_message}"
@@ -1382,29 +1474,29 @@ class RefreshTokenRegistrationEngine:
             if self._is_existing_account:
                 self._log("检测到该邮箱已注册，切换到登录流程获取 Token")
             else:
-                self._log("5. 设置密码...")
+                self._log("6. 设置密码...")
                 password_ok, _ = self._register_password()
                 if not password_ok:
                     result.error_message = "注册密码失败"
                     return result
 
-                self._log("6. 发送注册验证码...")
+                self._log("7. 发送注册验证码...")
                 if not self._send_verification_code():
                     result.error_message = "发送验证码失败"
                     return result
 
-                self._log("7. 等待注册验证码...")
+                self._log("8. 等待注册验证码...")
                 code = self._get_verification_code()
                 if not code:
                     result.error_message = "获取验证码失败"
                     return result
 
-                self._log("8. 校验注册验证码...")
+                self._log("9. 校验注册验证码...")
                 if not self._validate_verification_code(code):
                     result.error_message = "验证验证码失败"
                     return result
 
-                self._log("9. 创建用户账户...")
+                self._log("10. 创建用户账户...")
                 if not self._create_user_account():
                     result.error_message = "创建用户账户失败"
                     return result

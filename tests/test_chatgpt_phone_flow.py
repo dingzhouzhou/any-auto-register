@@ -198,6 +198,47 @@ class OAuthPhoneBlacklistTests(unittest.TestCase):
         phone_service.mark_blacklisted.assert_not_called()
         self.assertIn("whatsapp", client.last_error)
 
+    def test_continue_from_state_and_get_tokens_handles_add_phone(self):
+        client = OAuthClient(config={}, verbose=False)
+        client._log = lambda _msg: None
+
+        add_phone_state = FlowState(
+            page_type="add_phone",
+            current_url="https://auth.openai.com/add-phone",
+        )
+        consent_state = FlowState(
+            page_type="consent",
+            continue_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+            current_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+        )
+
+        with mock.patch.object(
+            client,
+            "_handle_add_phone_verification",
+            return_value=consent_state,
+        ) as handle_add_phone:
+            with mock.patch.object(
+                client,
+                "_oauth_submit_workspace_and_org",
+                return_value=("auth-code", None),
+            ) as submit_workspace:
+                with mock.patch.object(
+                    client,
+                    "_exchange_code_for_tokens",
+                    return_value={"access_token": "at", "refresh_token": "rt"},
+                ) as exchange:
+                    tokens = client.continue_from_state_and_get_tokens(
+                        add_phone_state,
+                        code_verifier="verifier",
+                        device_id="device-id",
+                        user_agent="Mozilla/5.0",
+                    )
+
+        self.assertEqual(tokens, {"access_token": "at", "refresh_token": "rt"})
+        handle_add_phone.assert_called_once()
+        submit_workspace.assert_called_once()
+        exchange.assert_called_once_with("auth-code", "verifier", "Mozilla/5.0", None)
+
 
 if __name__ == "__main__":
     unittest.main()

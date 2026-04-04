@@ -68,6 +68,7 @@ class SMSToMePhoneService:
             countries=self.country_slugs or None,
             output_path=self.global_file,
             max_pages_per_country=self.sync_max_pages_per_country,
+            trace=self.log_fn,
         )
         if count <= 0:
             raise RuntimeError("SMSToMe 号码池同步后为空")

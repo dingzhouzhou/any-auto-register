@@ -207,6 +207,7 @@ class RefreshTokenChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapter)
             proxy_url=context.proxy_url,
             callback_logger=context.callback_logger,
             browser_mode=context.browser_mode,
+            extra_config=context.extra_config,
         )
 
     def _should_fallback_to_access_token_only(self, result) -> bool:
